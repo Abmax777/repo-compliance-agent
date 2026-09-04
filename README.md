@@ -9,6 +9,8 @@ Built on Cloudflare Workers, Durable Objects and Workers AI.
 
 **Live:** https://repo-compliance-agent.abhinavk891.workers.dev
 
+Abridged from a real session:
+
 ```
 > Check gitleaks/gitleaks against the Codex
 
@@ -45,36 +47,7 @@ consequences.
 | User input | React chat UI (`src/app.tsx`) over the Agents SDK WebSocket transport |
 | Memory / state | Message history persisted in the DO's SQLite, plus explicit agent state (`scans`, `exceptions`) via `setState`, broadcast to connected clients |
 
-The model is Llama 3.3 rather than the agents-starter default. The default,
-`@cf/moonshotai/kimi-k2.7-code`, is not available on the Workers Free plan and
-fails every inference call with error 5035 — but `streamText` does not throw on a
-failed call, so this surfaced only as blank assistant messages with no error
-anywhere in the UI. Diagnosing it needed a temporary route that called the model
-outside the chat plumbing; the fix was to probe every function-calling model with
-a real tool call and pick from the ones that worked. Five did. Llama 3.3 was the
-choice because the assignment names it.
-
-The `onError` handler on `toUIMessageStreamResponse` is a direct result: a model
-call that fails silently is worse than one that fails loudly.
-
-With the model fixed, a second bug appeared. `workers-ai-provider` 3.3.1 emits
-every streamed tool-call argument delta twice, consecutively, so
-
-    {"ruleId": "has_codeowners"}
-
-arrives as
-
-    {"ruleId": "{"ruleId": "hashas_code_codeowners"}owners"}
-
-and fails to parse. It reproduces identically on Llama 3.3, Llama 4 Scout and
-Qwen3, which rules out the model. Upgrading the provider is not available: version
-4 requires `ai@^7`, while `agents` and `@cloudflare/ai-chat` both peer on `ai@^6`.
-
-The fix is `simulateStreamingMiddleware`, which routes through the provider's
-`doGenerate` — whose tool arguments are well formed — and synthesises the stream
-from the completed result. The chat, the tool loop and the approval gate are all
-unchanged; the only cost is that responses arrive in one piece rather than token
-by token. See `codexModel()` in `src/server.ts`.
+Both model choice and the streaming configuration are the result of two failures worth reading about — see [What broke, and how it was found](#what-broke-and-how-it-was-found).
 
 ## The Codex
 
@@ -85,7 +58,7 @@ Six rules, all programmatically checkable:
 | `has_readme` | A README exists at the repository root |
 | `has_license` | `LICENSE`, `LICENSE.md` or `LICENSE.txt` at the root |
 | `has_codeowners` | `CODEOWNERS` at the root, in `.github/` or in `docs/` |
-| `has_ci_config` | At least one `.github/workflows/*.yml` |
+| `has_ci_config` | At least one `.github/workflows/*.yml` or `*.yaml` |
 | `no_hardcoded_secrets` | No credential violations in the scanned files |
 | `has_tests_dir` | A `test/`, `tests/` or `__tests__/` directory exists |
 
@@ -146,6 +119,54 @@ Validated against repositories that deliberately contain planted keys —
 exercise is what surfaced the `testdata/` gap: Go's convention does not
 prefix-match `test/`, so fixtures were being reported as real violations.
 
+## What broke, and how it was found
+
+The model is Llama 3.3 rather than the agents-starter default. The default,
+`@cf/moonshotai/kimi-k2.7-code`, is not available on the Workers Free plan and
+fails every inference call with error 5035 — but `streamText` does not throw on a
+failed call, so this surfaced only as blank assistant messages with no error
+anywhere in the UI. Diagnosing it needed a temporary route that called the model
+outside the chat plumbing; the fix was to probe every function-calling model with
+a real tool call and pick from the ones that worked. Five did. Llama 3.3 was the
+choice because the assignment names it.
+
+The `onError` handler on `toUIMessageStreamResponse` is a direct result: a model
+call that fails silently is worse than one that fails loudly.
+
+With the model fixed, a second bug appeared. `workers-ai-provider` 3.3.1 emits
+every streamed tool-call argument delta twice, consecutively, so
+
+    {"ruleId": "has_codeowners"}
+
+arrives as
+
+    {"ruleId": "{"ruleId": "hashas_code_codeowners"}owners"}
+
+and fails to parse. It reproduces identically on Llama 3.3, Llama 4 Scout and
+Qwen3, which rules out the model. Upgrading the provider is not available: version
+4 requires `ai@^7`, while `agents` and `@cloudflare/ai-chat` both peer on `ai@^6`.
+
+The fix is `simulateStreamingMiddleware`, which routes through the provider's
+`doGenerate` — whose tool arguments are well formed — and synthesises the stream
+from the completed result. The chat, the tool loop and the approval gate are all
+unchanged; the only cost is that responses arrive in one piece rather than token
+by token. See `codexModel()` in `src/server.ts`.
+
+Both bugs shared a shape: a failure in the model layer that produced no error
+anywhere a user would look. Both were isolated the same way — with a temporary
+HTTP route that called the model outside the agent, the tools and the WebSocket
+transport, so the variable under test was the only one moving.
+
+The first probe used `generateText` while the application uses `streamText`. Those
+are different code paths in the provider and the second bug lives only in the
+streamed one, so that probe reported a clean bill of health on a broken system.
+Rewriting it to call `streamText` through the same `codexModel()` factory the
+agent uses caught the bug on the first run. Test the path you ship.
+
+Throughout both outages `/api/scan` continued returning correct reports, because
+the rule engine has no model in its path. That is the separation this project is
+built around, demonstrated under a real failure rather than asserted.
+
 ## Human in the loop
 
 `file_exception_request` is gated with `needsApproval`. The model can propose an
@@ -200,12 +221,14 @@ on its own.
 
 ```bash
 npm install
-cp .dev.vars.example .dev.vars      # add a GitHub PAT — classic, no scopes needed
+cp .dev.vars.example .dev.vars      # add a GitHub PAT (see below)
 npm run dev
 ```
 
 The PAT is only there to lift GitHub's rate limit from 60 to 5,000 requests/hour;
-every endpoint used is public read. It is optional — if `GITHUB_TOKEN` is absent,
+every endpoint used is public read. A classic token with **no scopes ticked** is
+enough, as is a fine-grained token limited to public repositories — granting
+`repo` would add write access to every private repository for no benefit. It is optional — if `GITHUB_TOKEN` is absent,
 or present but rejected, the scan falls back to unauthenticated requests and sets
 `authFallback` in the report so the agent can say so. A dead token degrades the
 tool rather than taking it down, which matters for something reviewed weeks after
@@ -227,9 +250,23 @@ npx wrangler secret put GITHUB_TOKEN
   than papered over, but it is not a substitute for gitleaks in CI.
 - **No secret verification.** A matched key is never tested against its provider,
   so a revoked credential still reports as a violation.
-- **Unauthenticated fallback is slow to notice.** If the token is rejected the scan
-  still completes, but at 60 requests/hour a burst of scans will start failing on
-  rate limits rather than on authentication.
+- **The unauthenticated fallback is a safety net, not a usable mode.** Requests
+  from a Worker leave via Cloudflare's shared egress IPs, so GitHub's 60/hour
+  anonymous allowance is shared with every other Worker and can be exhausted
+  before you make a single call. A rejected token keeps the app alive; it does not
+  keep it usable.
+- **The model can supply a stale repository identifier.** `file_exception_request`
+  takes `repo` from the model, which may reproduce a name from training data
+  rather than the repository just scanned — an observed case filed against
+  `zricethezav/gitleaks` after auditing `gitleaks/gitleaks`. The rule and
+  justification were correct; the identifier was not. The fix is to default `repo`
+  from the most recent entry in agent state and treat the model's value as a
+  fallback, so the model never restates a fact the system already holds.
+- **`has_tests_dir` encodes a JavaScript/Python convention.** Go places tests
+  beside the source they cover, so idiomatic Go repositories fail this rule
+  correctly by the letter and wrongly in spirit. This is the intended use of the
+  exception workflow rather than a bug, but a real Codex would make the rule
+  language-aware.
 - **The rules are invented.** They are plausible platform standards, not a real
   compliance framework.
 - **Exception requests are recorded, not routed.** They persist in Durable Object

@@ -128,11 +128,39 @@ Worth noting: `/api/scan` returned 200 throughout this outage. The rule engine h
 no model in its path, so the deterministic half of the system was unaffected by a
 total failure of the conversational half — which is the point of the split.
 
-## Session 3 — TODO
+## Session 2 (continued) — submission
 
-<!--
-Append as you go. For each meaningful prompt, record:
-  - what you asked for
-  - what you accepted, changed, or rejected, and why
-The "rejected" entries are the interesting ones for a reviewer.
--->
+**Renamed** the project to `repo-compliance-agent` for consistency with the
+repository. "Codex" was kept as the name of the *standard* rather than the tool,
+which makes the two names coherent instead of leftover.
+
+**Rewrote the README**, which until this point was still 245 lines of
+agents-starter boilerplate — describing demo tools that had been deleted and
+telling the reader to scaffold a new project. It is the first thing a reviewer
+opens, and everything else in the repository sits behind it.
+
+**Reviewed the README against the code** rather than against memory, which caught
+a rule documented as matching `.github/workflows/*.yml` when the implementation
+accepts `.ya?ml`.
+
+**Known issue, accepted rather than fixed:** `file_exception_request` takes `repo`
+from the model, and in one observed run the model filed against
+`zricethezav/gitleaks` — the project's former organisation, from training data —
+after auditing `gitleaks/gitleaks`. The rule and the justification were correct;
+only the identifier was wrong. The fix is to default `repo` from the most recent
+scan in agent state so the model never restates a fact the system already holds.
+Recorded in the README's limitations rather than fixed, on time grounds. It is the
+same category of error as everything else here: trusting a model for something
+deterministic code already knew.
+
+## What I would do next
+
+- Default the exception request's repository from agent state, as above.
+- Make `has_tests_dir` language-aware. Go places tests beside source, so idiomatic
+  Go repositories fail a rule that encodes a JavaScript/Python convention.
+- Route exception requests to a real ticketing system instead of Durable Object
+  state.
+- Expose the compliance check as an MCP server so it is callable from any MCP
+  client, not just this chat UI. The Agents SDK already provides the client half.
+- Revisit `simulateStreamingMiddleware` once `workers-ai-provider` supports
+  `ai@^6` with a working streaming path, and restore token-by-token responses.
