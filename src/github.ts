@@ -10,9 +10,9 @@
  * Content is pulled from raw.githubusercontent.com rather than the REST blobs
  * API: raw does not consume the 5000/hr REST quota. The candidate cap is
  * therefore about LATENCY and the Workers subrequest budget, not rate limits —
- * a Worker on the free plan is capped at 50 subrequests per request (1000 on
- * paid), so 40 candidates + 2 API calls deliberately sits just under it.
- * Verify the current limit for your plan before raising DEFAULT_MAX_CANDIDATES.
+ * a Worker on the Free plan is capped at 50 subrequests per request (10,000 on
+ * Paid), so 40 candidates + 2 API calls deliberately sits just under the Free
+ * ceiling and the project stays deployable without a paid plan.
  */
 
 import type { RepoFile, ScanScope } from "./codex-rules";
@@ -197,6 +197,32 @@ async function ghJson<T>(url: string, token?: string): Promise<T> {
  * fetch into a 401 that this function swallows as `null`, silently reporting
  * "0 files scanned" instead of an error.
  */
+/**
+ * Call the API with the token; if GitHub rejects the credentials, retry once
+ * anonymously and remember the downgrade.
+ *
+ * A dead PAT should not take down a tool that only ever reads public data. The
+ * token is a rate-limit optimisation, not an access requirement — so an invalid
+ * one degrades the scan rather than failing it, and the degradation is reported
+ * upward instead of being swallowed.
+ */
+async function ghJsonWithFallback<T>(
+  url: string,
+  token: string | undefined,
+  state: { authFallback: boolean },
+): Promise<T> {
+  if (token && !state.authFallback) {
+    try {
+      return await ghJson<T>(url, token);
+    } catch (error) {
+      if (!(error instanceof GitHubError) || error.status !== 401) throw error;
+      state.authFallback = true;
+      console.warn("[codex] GITHUB_TOKEN rejected (401); continuing unauthenticated at 60 req/hr");
+    }
+  }
+  return await ghJson<T>(url, undefined);
+}
+
 async function fetchRawFile(
   owner: string,
   repo: string,
@@ -256,20 +282,23 @@ export async function fetchRepoTree(
   const token = normalizeToken(options.token);
 
   // 1. repo metadata -> default branch + head sha
-  const meta = await ghJson<{ default_branch: string }>(
+  const authState = { authFallback: false };
+  const meta = await ghJsonWithFallback<{ default_branch: string }>(
     `${GITHUB_API}/repos/${owner}/${repo}`,
     token,
+    authState,
   );
   const defaultBranch = meta.default_branch;
 
   // 2. full recursive tree in one request
-  const tree = await ghJson<{
+  const tree = await ghJsonWithFallback<{
     sha: string;
     truncated: boolean;
     tree: { path: string; type: "blob" | "tree" | "commit"; size?: number; sha: string }[];
   }>(
     `${GITHUB_API}/repos/${owner}/${repo}/git/trees/${encodeURIComponent(defaultBranch)}?recursive=1`,
     token,
+    authState,
   );
 
   const blobs = tree.tree.filter((n) => n.type === "blob");
@@ -314,6 +343,7 @@ export async function fetchRepoTree(
     skippedFiles: files.length - scanned,
     skipReasons,
     treeTruncated: tree.truncated === true,
+    authFallback: authState.authFallback,
   };
 
   return { files, scope, commitSha: tree.sha, defaultBranch };

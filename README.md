@@ -1,244 +1,251 @@
-# Agent Starter
+# Repo Compliance Agent
 
-![npm i agents command](./npm-agents-banner.svg)
+A chat agent that audits public GitHub repositories against a set of engineering
+standards — referred to throughout as **the Codex** — explains what it found in
+plain language, and can file an approval-gated exception request when an engineer
+argues a rule should not apply.
 
-<a href="https://deploy.workers.cloudflare.com/?url=https://github.com/cloudflare/agents-starter"><img src="https://deploy.workers.cloudflare.com/button" alt="Deploy to Cloudflare"/></a>
+Built on Cloudflare Workers, Durable Objects and Workers AI.
 
-A starter template for building AI chat agents on Cloudflare, powered by the [Agents SDK](https://developers.cloudflare.com/agents/).
+**Live:** https://repo-compliance-agent.abhinavk891.workers.dev
 
-Uses Workers AI (no API key required), with tools for weather, timezone detection, calculations with approval, task scheduling, and vision (image input).
+```
+> Check gitleaks/gitleaks against the Codex
 
-## Quick start
+4 of 6 Codex rules pass. Two failures:
 
-```bash
-npx create-cloudflare@latest --template cloudflare/agents-starter
-cd agents-starter
-npm install
-npm run dev
+  no_hardcoded_secrets — 1 violation: a Google API key in config/gitleaks.toml:619
+  has_tests_dir        — no test/, tests/ or __tests__/ directory
+
+The test directory failure is arguably a false positive on a Go project: Go keeps
+tests beside the source they cover, so the convention this rule encodes does not
+apply. That is a good candidate for an exception request.
+
+There is also 1 warning I did not count as a failure: an AWS key in
+testdata/config/valid/allowlist_rule_regex.toml, suppressed as a test fixture.
+
+Coverage: 60 of 454 files were read for credentials. The rest were skipped as
+vendored, binary or over the size limit, so "clean" applies to what was scanned.
 ```
 
-> **Cloudflare authentication is required to run locally.** This template uses
-> Workers AI with `"ai": { "remote": true }` in `wrangler.jsonc`, and Workers AI
-> has no local simulator — so `npm run dev` opens a remote proxy session against
-> Cloudflare and needs you to be authenticated. Either run `wrangler login` once
-> in an interactive terminal, or set a `CLOUDFLARE_API_TOKEN` environment
-> variable (e.g. in a `.env` file). No third-party (OpenAI/Anthropic) key is
-> needed, but a Cloudflare login is.
+## Why this project
 
-Open [http://localhost:5173](http://localhost:5173) to see your agent in action.
+The role sits with Platforms & Productivity — Codex enforcement, CI/CD policy
+checks, remediation and exception workflows. Rather than build a generic chat
+demo, I built a small version of that remit: a deterministic policy engine, a
+conversational layer over it, and a human approval gate on the one action with
+consequences.
 
-Try these prompts to see the different features:
+## Assignment requirements
 
-- **"What's the weather in Paris?"** — server-side tool (runs automatically)
-- **"What timezone am I in?"** — client-side tool (browser provides the answer)
-- **"Calculate 5000 \* 3"** — approval tool (asks you before running)
-- **"Remind me in 5 minutes to take a break"** — scheduling
-- **Drop an image and ask "What's in this image?"** — vision (image understanding)
+| Requirement | Where it lives |
+|---|---|
+| LLM | Workers AI (`@cf/meta/llama-3.3-70b-instruct-fp8-fast`) via `workers-ai-provider` and the Vercel AI SDK, in `src/server.ts` |
+| Workflow / coordination | `ChatAgent`, a Durable Object extending `AIChatAgent`; multi-step tool loop with `stopWhen: stepCountIs(20)`; DO alarms drive scheduled re-audits |
+| User input | React chat UI (`src/app.tsx`) over the Agents SDK WebSocket transport |
+| Memory / state | Message history persisted in the DO's SQLite, plus explicit agent state (`scans`, `exceptions`) via `setState`, broadcast to connected clients |
 
-## Project structure
+The model is Llama 3.3 rather than the agents-starter default. The default,
+`@cf/moonshotai/kimi-k2.7-code`, is not available on the Workers Free plan and
+fails every inference call with error 5035 — but `streamText` does not throw on a
+failed call, so this surfaced only as blank assistant messages with no error
+anywhere in the UI. Diagnosing it needed a temporary route that called the model
+outside the chat plumbing; the fix was to probe every function-calling model with
+a real tool call and pick from the ones that worked. Five did. Llama 3.3 was the
+choice because the assignment names it.
+
+The `onError` handler on `toUIMessageStreamResponse` is a direct result: a model
+call that fails silently is worse than one that fails loudly.
+
+With the model fixed, a second bug appeared. `workers-ai-provider` 3.3.1 emits
+every streamed tool-call argument delta twice, consecutively, so
+
+    {"ruleId": "has_codeowners"}
+
+arrives as
+
+    {"ruleId": "{"ruleId": "hashas_code_codeowners"}owners"}
+
+and fails to parse. It reproduces identically on Llama 3.3, Llama 4 Scout and
+Qwen3, which rules out the model. Upgrading the provider is not available: version
+4 requires `ai@^7`, while `agents` and `@cloudflare/ai-chat` both peer on `ai@^6`.
+
+The fix is `simulateStreamingMiddleware`, which routes through the provider's
+`doGenerate` — whose tool arguments are well formed — and synthesises the stream
+from the completed result. The chat, the tool loop and the approval gate are all
+unchanged; the only cost is that responses arrive in one piece rather than token
+by token. See `codexModel()` in `src/server.ts`.
+
+## The Codex
+
+Six rules, all programmatically checkable:
+
+| Rule | Passes when |
+|---|---|
+| `has_readme` | A README exists at the repository root |
+| `has_license` | `LICENSE`, `LICENSE.md` or `LICENSE.txt` at the root |
+| `has_codeowners` | `CODEOWNERS` at the root, in `.github/` or in `docs/` |
+| `has_ci_config` | At least one `.github/workflows/*.yml` |
+| `no_hardcoded_secrets` | No credential violations in the scanned files |
+| `has_tests_dir` | A `test/`, `tests/` or `__tests__/` directory exists |
+
+All matching is case-insensitive. That is not cosmetic: `sindresorhus/got` ships
+`readme.md` and an extensionless `license`, and a naive implementation reports one
+of the best-known packages on npm as non-compliant.
+
+## Two decisions worth explaining
+
+### Bounded scanning, with coverage reported
+
+Reading every file to hunt for secrets is not viable — a Worker on the Free plan
+is capped at 50 subrequests per request, and `facebook/react` alone has 7,211
+files.
+
+So the scan is bounded. One call to the recursive git-tree API returns every path
+and size, which is enough to answer all five structural rules for free. Content is
+then fetched only for ranked candidates: vendored directories, lockfiles, minified
+output, binaries and files over 200 KB are dropped; the remainder is ranked with
+env/IaC/config files first, then source; the top 40 are read. Content comes from
+`raw.githubusercontent.com`, which does not consume the REST quota, so the cap is
+a subrequest and latency budget rather than a rate-limit one.
+
+The important part is that the limit is **reported, not hidden**. Every report
+carries `scannedFiles`, `skippedFiles` and a breakdown of skip reasons, and the
+system prompt requires the agent to state coverage whenever it discusses secrets.
+Scanning 40 of 7,211 files and announcing "no secrets found" would be a false
+assurance. Saying "no secrets in the 40 files scanned, here is what was skipped"
+is a true statement a reviewer can act on.
+
+### Precision over recall, with two severities
+
+The obvious `(api_key|secret|token)\s*=\s*"..."` pattern is a false-positive
+cannon — it fires on `API_KEY = "your-api-key-here"` in most READMEs on GitHub.
+It is deliberately absent.
+
+Every pattern here is anchored on a vendor prefix with a known body length:
+`AKIA…`, `ghp_…`, `sk_live_…`, `xox[abposr]-…`, `AIza…`, PEM headers. When an LLM
+narrates findings to a human as fact, a false positive is more damaging than a
+miss: it teaches the reviewer to distrust the tool.
+
+Findings are then split in two. A match with nothing suppressing it is a
+`violation`. A match that trips a suppressor is a `warning`:
+
+- **placeholder** — the match contains `example`, `your-`, `changeme`, …
+  (this catches `AKIAIOSFODNN7EXAMPLE`, AWS's own documentation key)
+- **test_path** — the file sits under `test/`, `testdata/`, `test_data/`,
+  `fixtures/`, `docs/`, …
+- **low_entropy** — Shannon entropy of the match is below 3.0 bits/char, so it
+  matches the shape but cannot be a real key
+
+Only violations fail the rule; warnings are reported as context. Matches are
+redacted at the point of detection (`AKIA****************`), so no credential ever
+reaches model context or the chat transcript.
+
+Validated against repositories that deliberately contain planted keys —
+`gitleaks/gitleaks`, `trufflesecurity/trufflehog`, `Yelp/detect-secrets`. That
+exercise is what surfaced the `testdata/` gap: Go's convention does not
+prefix-match `test/`, so fixtures were being reported as real violations.
+
+## Human in the loop
+
+`file_exception_request` is gated with `needsApproval`. The model can propose an
+exception and populate the justification, but the SDK suspends the call in
+`approval-requested` state and the UI renders Approve / Reject. Nothing is
+recorded until a person clicks.
+
+Granting a compliance exemption is a governance action. It is exactly the class of
+thing that should not happen on a language model's say-so, which is why it is the
+one gated tool while the read-only tools execute freely.
+
+## Architecture
 
 ```
 src/
-  server.ts    # Chat agent with tools and scheduling
-  app.tsx      # Chat UI built with Kumo components
-  client.tsx   # React entry point
-  styles.css   # Tailwind + Kumo styles
+  codex-rules.ts   pure rule logic — no Cloudflare imports, no network, no I/O
+  github.ts        GitHub REST + raw client, scoping and ranking policy
+  server.ts        ChatAgent (Durable Object), tool definitions, /api/scan
+  app.tsx          chat UI
+test/
+  codex-rules.test.ts   29 tests
+  fixtures.ts           synthetic repos, including real-world edge cases
 ```
 
-## What's included
+`codex-rules.ts` imports nothing. That is what lets the rule engine be tested in a
+plain Node environment with no miniflare, no wrangler and no network — the suite
+runs in about 130 ms. It also means the deterministic core can be reasoned about
+independently of the agent wrapped around it.
 
-- **AI Chat** — Streaming responses powered by Workers AI via `AIChatAgent`
-- **Image input** — Drag-and-drop, paste, or click to attach images for vision-capable models
-- **Three tool patterns** — server-side auto-execute, client-side (browser), and human-in-the-loop approval
-- **Scheduling** — one-time, delayed, and recurring (cron) tasks
-- **Reasoning display** — shows model thinking as it streams, collapses when done
-- **Debug mode** — toggle in the header to inspect raw message JSON for each message
-- **Kumo UI** — Cloudflare's design system with dark/light mode
-- **Real-time** — WebSocket connection with automatic reconnection and message persistence
-
-## Making it your own
-
-### Name your project
-
-Update the name in `package.json` and `wrangler.jsonc` — the `name` in `wrangler.jsonc` becomes your deployed Worker's URL (`<name>.<subdomain>.workers.dev`).
-
-### Change the system prompt
-
-Edit the `system` string in `server.ts` to give your agent a different personality or focus area. This is the most impactful single change you can make.
-
-### Replace the demo tools with real ones
-
-The starter ships with demo tools (`getWeather` returns random data, `calculate` does basic arithmetic). Replace them with real implementations:
-
-```ts
-// In server.ts, replace a demo tool with a real API call:
-getWeather: tool({
-  description: "Get the current weather for a city",
-  inputSchema: z.object({ city: z.string() }),
-  execute: async ({ city }) => {
-    const res = await fetch(`https://api.weather.example/${city}`);
-    return res.json();
-  }
-}),
-```
-
-### Add your own tools
-
-Add new tools to the `tools` object in `server.ts`. There are three patterns:
-
-```ts
-// Auto-execute: runs on the server, no user interaction
-myTool: tool({
-  description: "...",
-  inputSchema: z.object({ /* ... */ }),
-  execute: async (input) => { /* return result */ }
-}),
-
-// Client-side: no execute function, browser provides the result
-// Handle it in app.tsx via the onToolCall callback
-browserTool: tool({
-  description: "...",
-  inputSchema: z.object({ /* ... */ })
-}),
-
-// Approval: add needsApproval to gate execution
-sensitiveTool: tool({
-  description: "...",
-  inputSchema: z.object({ /* ... */ }),
-  needsApproval: async (input) => true, // or conditional logic
-  execute: async (input) => { /* runs after approval */ }
-}),
-```
-
-### Customize scheduled task behavior
-
-When a scheduled task fires, `executeTask` runs on the server. It does its work and then uses `this.broadcast()` to notify connected clients (shown as a toast notification in the UI). Replace it with your own logic:
-
-```ts
-async executeTask(description: string, task: Schedule<string>) {
-  // Do the actual work
-  await sendEmail({ to: "user@example.com", subject: description });
-
-  // Notify connected clients
-  this.broadcast(
-    JSON.stringify({ type: "scheduled-task", description, timestamp: new Date().toISOString() })
-  );
-}
-```
-
-> **Why `broadcast()` instead of `saveMessages()`?** Injecting into chat history can cause the AI to see the notification as new context and re-trigger the same task in a loop. `broadcast()` sends a one-off event that the client displays separately from the conversation.
-
-### Remove scheduling
-
-If you don't need scheduling, remove `scheduleTask`, `getScheduledTasks`, and `cancelScheduledTask` from the tools object, the `executeTask` method, and the schedule-related imports (`getSchedulePrompt`, `scheduleSchema`, `Schedule`).
-
-### Add state beyond chat messages
-
-Use `this.setState()` and `this.state` for real-time state that syncs to all connected clients. See [Store and sync state](https://developers.cloudflare.com/agents/api-reference/store-and-sync-state/).
-
-### Add callable methods
-
-Expose agent methods as typed RPC that your client can call directly:
-
-```ts
-import { callable } from "agents";
-
-export class ChatAgent extends AIChatAgent<Env> {
-  @callable()
-  async getStats() {
-    return { messageCount: this.messages.length };
-  }
-}
-
-// Client-side:
-const stats = await agent.call("getStats");
-```
-
-See [Callable methods](https://developers.cloudflare.com/agents/api-reference/callable-methods/).
-
-### Connect to MCP servers
-
-Add external tools from MCP servers:
-
-```ts
-async onChatMessage(onFinish, options) {
-  // Connect to an MCP server
-  await this.mcp.connect("https://my-mcp-server.example/sse");
-
-  const result = streamText({
-    // ...
-    tools: {
-      ...myTools,
-      ...this.mcp.getAITools() // Include MCP tools
-    }
-  });
-}
-```
-
-See [MCP Client API](https://developers.cloudflare.com/agents/api-reference/mcp-client-api/).
-
-## Use a different AI model provider
-
-The starter uses [Workers AI](https://developers.cloudflare.com/workers-ai/) by default (no API key needed). To use a different provider:
-
-### OpenAI
+The same `scanRepository()` backs both the chat tool and a plain HTTP endpoint, so
+the two can never disagree:
 
 ```bash
-npm install @ai-sdk/openai
+curl "https://repo-compliance-agent.abhinavk891.workers.dev/api/scan?repo=gitleaks/gitleaks"
 ```
 
-```ts
-// In server.ts, replace the model:
-import { openai } from "@ai-sdk/openai";
+That endpoint is the rule engine with no LLM in the path — useful for debugging a
+rule without spending a model call, and it makes the deterministic core demoable
+on its own.
 
-// Inside onChatMessage:
-const result = streamText({
-  model: openai("gpt-5.2")
-  // ...
-});
-```
+## Tools exposed to the model
 
-Create a `.env` file with your API key:
+| Tool | Behaviour |
+|---|---|
+| `check_repo_compliance` | Audits a repository. Auto-executes. |
+| `explain_rule` | Returns a rule's requirement and rationale. Auto-executes. |
+| `file_exception_request` | **Requires human approval.** Records an exception request. |
+| `recent_activity` | Reads scan and exception history from DO state. |
+| `schedule_rescan` / `list_scheduled_rescans` / `cancel_rescan` | Re-audits on a delay or cron, driven by DO alarms. |
 
-```
-OPENAI_API_KEY=your-key-here
-```
-
-### Anthropic
+## Running it
 
 ```bash
-npm install @ai-sdk/anthropic
+npm install
+cp .dev.vars.example .dev.vars      # add a GitHub PAT — classic, no scopes needed
+npm run dev
 ```
 
-```ts
-import { anthropic } from "@ai-sdk/anthropic";
+The PAT is only there to lift GitHub's rate limit from 60 to 5,000 requests/hour;
+every endpoint used is public read. It is optional — if `GITHUB_TOKEN` is absent,
+or present but rejected, the scan falls back to unauthenticated requests and sets
+`authFallback` in the report so the agent can say so. A dead token degrades the
+tool rather than taking it down, which matters for something reviewed weeks after
+the credential was minted.
 
-const result = streamText({
-  model: anthropic("claude-sonnet-4-20250514")
-  // ...
-});
-```
-
-Create a `.env` file with your API key:
-
-```
-ANTHROPIC_API_KEY=your-key-here
-```
-
-## Deploy
+Workers AI has no local simulator, so `npm run dev` proxies to Cloudflare and
+needs `wrangler login`.
 
 ```bash
+npm test              # rule engine, no network
 npm run deploy
+npx wrangler secret put GITHUB_TOKEN
 ```
 
-Your agent is live on Cloudflare's global network. Messages persist in SQLite, streams resume on disconnect, and the agent hibernates when idle.
+## Limitations
 
-## Learn more
+- **Public repositories only.** Private repos return "not found, or it is private".
+- **Bounded secret scanning.** 40 files by default. Coverage is reported rather
+  than papered over, but it is not a substitute for gitleaks in CI.
+- **No secret verification.** A matched key is never tested against its provider,
+  so a revoked credential still reports as a violation.
+- **Unauthenticated fallback is slow to notice.** If the token is rejected the scan
+  still completes, but at 60 requests/hour a burst of scans will start failing on
+  rate limits rather than on authentication.
+- **The rules are invented.** They are plausible platform standards, not a real
+  compliance framework.
+- **Exception requests are recorded, not routed.** They persist in Durable Object
+  state; wiring them to a real ticketing system is a `TODO` in `server.ts`.
+- **Responses are not token-streamed.** The provider's streaming path corrupts
+  tool-call arguments, so the model runs through `doGenerate` behind
+  `simulateStreamingMiddleware`. Replies appear all at once. Reverting is a
+  one-line change once the provider is fixed.
+- **Tree truncation.** GitHub truncates the recursive tree API on very large
+  repositories. The report exposes `treeTruncated`, but the structural rules would
+  be scanning an incomplete file list when it is set.
 
-- [Agents SDK documentation](https://developers.cloudflare.com/agents/)
-- [Build a chat agent tutorial](https://developers.cloudflare.com/agents/getting-started/build-a-chat-agent/)
-- [Chat agents API reference](https://developers.cloudflare.com/agents/api-reference/chat-agents/)
-- [Workers AI models](https://developers.cloudflare.com/workers-ai/models/)
+## AI prompt history
+
+`PROMPTS.md` — required by the assignment. It records what was asked, what was
+accepted, what was rejected and why.
 
 ## License
 

@@ -81,6 +81,12 @@ export interface ScanScope {
   skipReasons: Record<string, number>;
   /** GitHub caps the recursive tree API; if true, we did not see every path. */
   treeTruncated: boolean;
+  /**
+   * Set when GITHUB_TOKEN was present but rejected, and the scan fell back to
+   * unauthenticated requests (60 req/hr instead of 5,000). The scan still ran;
+   * the report must say so rather than hide the degradation.
+   */
+  authFallback?: boolean;
 }
 
 export interface ComplianceReport {
@@ -163,8 +169,19 @@ export const PLACEHOLDER_MARKERS = [
   "redacted", "changeme", "insert", "sample", "fake", "notreal", "todo",
 ];
 
-/** A hit under one of these path prefixes is a warning, not a violation. */
-export const TEST_PATH_MARKERS = ["test/", "tests/", "__tests__/", "fixtures/", "docs/", "examples/", "example/", "spec/"];
+/**
+ * A hit under one of these path segments is a warning, not a violation.
+ *
+ * `testdata/` (Go convention) and `test_data/` (Python convention) need their own
+ * entries: matching is `startsWith(marker) || includes("/" + marker)`, so the
+ * "test/" entry does NOT cover them. Found by scanning gitleaks and trufflehog,
+ * whose planted fixtures live in `testdata/` and were being reported as real
+ * violations.
+ */
+export const TEST_PATH_MARKERS = [
+  "test/", "tests/", "testdata/", "test_data/", "__tests__/",
+  "fixtures/", "docs/", "examples/", "example/", "spec/",
+];
 
 /** Matches scoring below this are dropped as not-random-enough to be a real key. */
 export const ENTROPY_FLOOR = 3.0;

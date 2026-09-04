@@ -68,6 +68,15 @@ describe("classifySuppression", () => {
   it("flags a low-entropy match", () => {
     expect(classifySuppression("AKIAAAAAAAAAAAAAAAAA", "src/x.ts")).toBe("low_entropy");
   });
+  it("treats Go's testdata/ and Python's test_data/ as test paths", () => {
+    // Regression: both conventions were reported as real violations when
+    // scanning gitleaks and trufflehog, because "test/" does not prefix-match
+    // "testdata/".
+    expect(classifySuppression("AKIA7QF3JZ2XN8VLKD4M", "testdata/secrets.txt")).toBe("test_path");
+    expect(classifySuppression("AKIA7QF3JZ2XN8VLKD4M", "pkg/engine/testdata/secrets.txt")).toBe("test_path");
+    expect(classifySuppression("AKIA7QF3JZ2XN8VLKD4M", "test_data/config.yaml")).toBe("test_path");
+  });
+
   it("suppresses nothing for a plausible key in production source", () => {
     expect(classifySuppression("AKIA7QF3JZ2XN8VLKD4M", "src/config.js")).toBeUndefined();
   });

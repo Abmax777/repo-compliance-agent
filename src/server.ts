@@ -5,9 +5,11 @@ import { AIChatAgent, type OnChatMessageOptions } from "@cloudflare/ai-chat";
 import {
   convertToModelMessages,
   pruneMessages,
+  simulateStreamingMiddleware,
   stepCountIs,
   streamText,
-  tool
+  tool,
+  wrapLanguageModel
 } from "ai";
 import { z } from "zod";
 
@@ -91,7 +93,8 @@ function forModel(report: ComplianceReport) {
       filesScannedForSecrets: report.scope.scannedFiles,
       filesSkipped: report.scope.skippedFiles,
       skipReasons: report.scope.skipReasons,
-      treeTruncated: report.scope.treeTruncated
+      treeTruncated: report.scope.treeTruncated,
+      authFallback: report.scope.authFallback
     },
     results: report.results.map((r) => ({
       ruleId: r.ruleId,
@@ -110,6 +113,38 @@ function forModel(report: ComplianceReport) {
   };
 }
 
+/**
+ * The model, with the provider's streaming path bypassed.
+ *
+ * Two problems with the stock configuration, both found by probing:
+ *
+ * 1. The agents-starter default (`@cf/moonshotai/kimi-k2.7-code`) is not
+ *    available on the Workers Free plan and fails every call with error 5035.
+ *    Llama 3.3 is free-plan available and is the model the assignment names.
+ *
+ * 2. workers-ai-provider 3.3.1 emits every streamed tool-call argument delta
+ *    TWICE, consecutively, so `{"ruleId": "has_codeowners"}` arrives as
+ *    `{"ruleId": "{"ruleId": "hashas_code_codeowners"}owners"}` and fails to
+ *    parse. Reproduced identically on Llama 3.3, Llama 4 Scout and Qwen3, which
+ *    is what rules out the model as the cause. Version 4 of the provider is not
+ *    an option: it requires ai@^7, while `agents` and `@cloudflare/ai-chat` both
+ *    peer on ai@^6.
+ *
+ * `simulateStreamingMiddleware` routes through the provider's `doGenerate`
+ * instead — which produces well-formed tool arguments — and synthesises the
+ * stream from the completed result. The trade-off is that responses arrive in
+ * one piece rather than token by token. Correct output beats a nicer cursor.
+ */
+export function codexModel(env: Env, sessionAffinity?: unknown) {
+  const workersai = createWorkersAI({ binding: env.AI });
+  return wrapLanguageModel({
+    model: workersai("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
+      sessionAffinity: sessionAffinity as never
+    }),
+    middleware: simulateStreamingMiddleware()
+  });
+}
+
 const SYSTEM_PROMPT = `You are the Codex Compliance Agent. You audit public GitHub repositories against the Codex engineering standards and explain the results to engineers in plain language.
 
 The six Codex rules are: ${ALL_RULE_IDS.join(", ")}.
@@ -122,7 +157,8 @@ How to behave:
 - Secrets are already redacted when they reach you. Never attempt to reconstruct or print a full credential.
 - If a user disagrees with a finding or says a rule does not apply, offer file_exception_request. That tool requires explicit human approval before it runs — tell the user you are requesting their approval, and do not pretend it succeeded until you see the result.
 - Use explain_rule when someone asks why a standard exists.
-- If the repository is private, missing, or GitHub rate-limits the request, say exactly that rather than inventing a report.`;
+- If the repository is private, missing, or GitHub rate-limits the request, say exactly that rather than inventing a report.
+- If coverage reports authFallback, the configured GitHub token was rejected and the scan ran unauthenticated on a much tighter rate limit. Mention it once — the results are still valid, but the operator should know the token needs replacing.`;
 
 export class ChatAgent extends AIChatAgent<Env, CodexAgentState> {
   initialState: CodexAgentState = { scans: [], exceptions: [] };
@@ -184,9 +220,7 @@ export class ChatAgent extends AIChatAgent<Env, CodexAgentState> {
     const workersai = createWorkersAI({ binding: this.env.AI });
 
     const result = streamText({
-      model: workersai("@cf/moonshotai/kimi-k2.7-code", {
-        sessionAffinity: this.sessionAffinity
-      }),
+      model: codexModel(this.env, this.sessionAffinity),
       system: `${SYSTEM_PROMPT}
 
 ${getSchedulePrompt({ date: new Date() })}`,
@@ -336,7 +370,23 @@ ${getSchedulePrompt({ date: new Date() })}`,
       abortSignal: options?.abortSignal
     });
 
-    return result.toUIMessageStreamResponse();
+    return result.toUIMessageStreamResponse({
+      /**
+       * streamText does not throw — a failed inference call resolves with an
+       * empty stream, so without this the UI renders a blank assistant message
+       * and the cause is lost. Log it server-side and surface it to the client.
+       */
+      onError: (error) => {
+        const err = error as { message?: string; cause?: unknown; name?: string };
+        console.error("[codex] streamText failed:", {
+          name: err?.name,
+          message: err?.message,
+          cause: err?.cause,
+          raw: JSON.stringify(error, Object.getOwnPropertyNames(error ?? {})).slice(0, 2000)
+        });
+        return `Model call failed: ${err?.message ?? String(error)}`;
+      }
+    });
   }
 
   /**
