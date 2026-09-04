@@ -700,14 +700,14 @@ function Chat() {
           {messages.length === 0 && (
             <Empty
               icon={<ChatCircleDotsIcon size={32} />}
-              title="Start a conversation"
+              title="Audit a repository against the Codex"
               contents={
                 <div className="flex flex-wrap justify-center gap-2">
                   {[
-                    "What's the weather in Paris?",
-                    "What timezone am I in?",
-                    "Calculate 5000 * 3",
-                    "Remind me in 5 minutes to take a break"
+                    "Check sindresorhus/got against the Codex",
+                    "Why does Codex require CODEOWNERS?",
+                    "Scan cloudflare/agents-starter",
+                    "Re-audit facebook/react every Monday"
                   ].map((prompt) => (
                     <Button
                       key={prompt}

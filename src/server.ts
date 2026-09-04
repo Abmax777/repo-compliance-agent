@@ -11,15 +11,127 @@ import {
 } from "ai";
 import { z } from "zod";
 
-export class ChatAgent extends AIChatAgent<Env> {
+import {
+  ALL_RULE_IDS,
+  explainRule,
+  runAllRules,
+  type ComplianceReport,
+  type RuleId
+} from "./codex-rules";
+import { GitHubError, fetchRepoTree, parseRepoRef } from "./github";
+
+// ---------------------------------------------------------------------------
+// Durable Object state — this is the "memory" leg of the assignment.
+// Agent state is persisted in the DO and broadcast to connected clients on
+// every setState, so the UI can render scan history without extra plumbing.
+// ---------------------------------------------------------------------------
+
+export interface ScanRecord {
+  repo: string;
+  checkedAt: string;
+  passed: number;
+  failed: number;
+  failedRuleIds: RuleId[];
+}
+
+export interface ExceptionRecord {
+  id: string;
+  repo: string;
+  ruleId: RuleId;
+  justification: string;
+  filedAt: string;
+}
+
+export interface CodexAgentState {
+  scans: ScanRecord[];
+  exceptions: ExceptionRecord[];
+}
+
+const MAX_REMEMBERED_SCANS = 20;
+
+// ---------------------------------------------------------------------------
+// Shared scan path — used by BOTH the plain HTTP endpoint and the LLM tool.
+// Keeping one implementation means the day-1 checkpoint and the day-2 chat
+// agent can never disagree about what a scan returns.
+// ---------------------------------------------------------------------------
+
+export async function scanRepository(
+  ref: string,
+  token?: string
+): Promise<ComplianceReport> {
+  const parsed = parseRepoRef(ref);
+  if (!parsed) {
+    throw new GitHubError(
+      `"${ref}" is not a repository reference. Use owner/name or a github.com URL.`,
+      400,
+      "other"
+    );
+  }
+  const { files, scope } = await fetchRepoTree(parsed.owner, parsed.repo, {
+    token: token || undefined
+  });
+  return runAllRules(`${parsed.owner}/${parsed.repo}`, files, scope);
+}
+
+/**
+ * Project a full report down to what the model actually needs.
+ *
+ * The full report can carry hundreds of evidence paths; feeding all of it back
+ * into context wastes tokens and gives the model room to hallucinate detail.
+ * Trim evidence to three entries per rule and keep findings redacted.
+ */
+function forModel(report: ComplianceReport) {
+  return {
+    repo: report.repo,
+    checkedAt: report.checkedAt,
+    passed: report.passed,
+    failed: report.failed,
+    coverage: {
+      filesInRepo: report.scope.totalFiles,
+      filesScannedForSecrets: report.scope.scannedFiles,
+      filesSkipped: report.scope.skippedFiles,
+      skipReasons: report.scope.skipReasons,
+      treeTruncated: report.scope.treeTruncated
+    },
+    results: report.results.map((r) => ({
+      ruleId: r.ruleId,
+      passed: r.passed,
+      title: r.title,
+      summary: r.summary,
+      evidence: r.evidence.slice(0, 3),
+      findings: r.findings?.map((f) => ({
+        pattern: f.patternName,
+        severity: f.severity,
+        location: `${f.path}:${f.line}`,
+        match: f.redacted,
+        suppressedBy: f.suppressedBy
+      }))
+    }))
+  };
+}
+
+const SYSTEM_PROMPT = `You are the Codex Compliance Agent. You audit public GitHub repositories against the Codex engineering standards and explain the results to engineers in plain language.
+
+The six Codex rules are: ${ALL_RULE_IDS.join(", ")}.
+
+How to behave:
+- When a user names a repository, call check_repo_compliance. Never guess a verdict; never claim a rule passed or failed without a tool result.
+- Report the outcome conversationally. Lead with the headline (how many rules passed), then walk the failures. Do not dump raw JSON at the user.
+- Always state scan coverage when discussing no_hardcoded_secrets. The scan reads a bounded subset of files, so "no secrets found" means "none in the files scanned". Say so, with the numbers.
+- Distinguish severities. A "violation" is a credible finding. A "warning" was matched but suppressed as a placeholder, a test fixture, or low-entropy — mention warnings as context, not as failures.
+- Secrets are already redacted when they reach you. Never attempt to reconstruct or print a full credential.
+- If a user disagrees with a finding or says a rule does not apply, offer file_exception_request. That tool requires explicit human approval before it runs — tell the user you are requesting their approval, and do not pretend it succeeded until you see the result.
+- Use explain_rule when someone asks why a standard exists.
+- If the repository is private, missing, or GitHub rate-limits the request, say exactly that rather than inventing a report.`;
+
+export class ChatAgent extends AIChatAgent<Env, CodexAgentState> {
+  initialState: CodexAgentState = { scans: [], exceptions: [] };
+
   maxPersistedMessages = 100;
   chatRecovery = true;
-  // Wait for MCP connections to be re-established after hibernation before
-  // processing a message, so MCP tools aren't intermittently missing.
   waitForMcpConnections = true;
 
   onStart() {
-    // Configure OAuth popup behavior for MCP servers that require authentication
     this.mcp.configureOAuthCallback({
       customHandler: (result) => {
         if (result.authSuccess) {
@@ -46,6 +158,27 @@ export class ChatAgent extends AIChatAgent<Env> {
     await this.removeMcpServer(serverId);
   }
 
+  private rememberScan(report: ComplianceReport) {
+    const record: ScanRecord = {
+      repo: report.repo,
+      checkedAt: report.checkedAt,
+      passed: report.passed,
+      failed: report.failed,
+      failedRuleIds: report.results.filter((r) => !r.passed).map((r) => r.ruleId)
+    };
+    this.setState({
+      ...this.state,
+      scans: [record, ...this.state.scans].slice(0, MAX_REMEMBERED_SCANS)
+    });
+  }
+
+  private rememberException(record: ExceptionRecord) {
+    this.setState({
+      ...this.state,
+      exceptions: [record, ...this.state.exceptions]
+    });
+  }
+
   async onChatMessage(_onFinish: unknown, options?: OnChatMessageOptions) {
     const mcpTools = this.mcp.getAITools();
     const workersai = createWorkersAI({ binding: this.env.AI });
@@ -54,87 +187,109 @@ export class ChatAgent extends AIChatAgent<Env> {
       model: workersai("@cf/moonshotai/kimi-k2.7-code", {
         sessionAffinity: this.sessionAffinity
       }),
-      system: `You are a helpful assistant that can understand images. You can check the weather, get the user's timezone, run calculations, and schedule tasks. When users share images, describe what you see and answer questions about them.
+      system: `${SYSTEM_PROMPT}
 
-${getSchedulePrompt({ date: new Date() })}
-
-If the user asks to schedule a task, use the schedule tool to schedule the task.`,
-      // Prune old tool calls and reasoning to save tokens on long conversations
+${getSchedulePrompt({ date: new Date() })}`,
       messages: pruneMessages({
         messages: await convertToModelMessages(this.messages),
         toolCalls: "before-last-2-messages",
         reasoning: "before-last-message"
       }),
       tools: {
-        // MCP tools from connected servers
         ...mcpTools,
 
-        // Server-side tool: runs automatically on the server
-        getWeather: tool({
-          description: "Get the current weather for a city",
+        check_repo_compliance: tool({
+          description:
+            "Audit a public GitHub repository against all six Codex engineering standards. Returns a per-rule verdict plus the coverage of the secret scan. Use this whenever a user names a repository.",
           inputSchema: z.object({
-            city: z.string().describe("City name")
+            repo: z
+              .string()
+              .describe(
+                'The repository, as "owner/name" or a full github.com URL.'
+              )
           }),
-          execute: async ({ city }) => {
-            // Replace with a real weather API in production
-            const conditions = ["sunny", "cloudy", "rainy", "snowy"];
-            const temp = Math.floor(Math.random() * 30) + 5;
+          execute: async ({ repo }) => {
+            try {
+              const report = await scanRepository(repo, this.env.GITHUB_TOKEN);
+              this.rememberScan(report);
+              return forModel(report);
+            } catch (error) {
+              if (error instanceof GitHubError) {
+                return { error: error.message, kind: error.kind };
+              }
+              return { error: `Scan failed: ${String(error)}` };
+            }
+          }
+        }),
+
+        explain_rule: tool({
+          description:
+            "Explain what a single Codex rule requires and why the standard exists. Use when a user asks why a rule matters or pushes back on a finding.",
+          inputSchema: z.object({
+            ruleId: z.enum(ALL_RULE_IDS as [RuleId, ...RuleId[]])
+          }),
+          execute: async ({ ruleId }) =>
+            explainRule(ruleId) ?? {
+              error: `No Codex rule with id "${ruleId}".`
+            }
+        }),
+
+        // --- the human-in-the-loop piece --------------------------------
+        // needsApproval short-circuits execution: the SDK persists the call in
+        // "approval-requested" state, the UI renders Approve / Reject, and
+        // execute() only runs on approval. Filing a compliance exception is
+        // exactly the kind of action that should never happen on a model's say-so.
+        file_exception_request: tool({
+          description:
+            "File a formal request to exempt a repository from one Codex rule. Requires human approval before it is recorded. Only offer this when the user has given a concrete justification.",
+          inputSchema: z.object({
+            repo: z.string().describe('The repository, as "owner/name".'),
+            ruleId: z.enum(ALL_RULE_IDS as [RuleId, ...RuleId[]]),
+            justification: z
+              .string()
+              .min(10)
+              .describe(
+                "The engineer's stated reason the rule should not apply. Use their words, do not invent a rationale."
+              )
+          }),
+          needsApproval: async () => true,
+          execute: async ({ repo, ruleId, justification }) => {
+            const record: ExceptionRecord = {
+              id: crypto.randomUUID(),
+              repo,
+              ruleId,
+              justification,
+              filedAt: new Date().toISOString()
+            };
+            this.rememberException(record);
+            // TODO(day 2, optional): POST to a real ticketing system here.
+            console.log("[codex] exception filed", record);
             return {
-              city,
-              temperature: temp,
-              condition:
-                conditions[Math.floor(Math.random() * conditions.length)],
-              unit: "celsius"
+              status: "filed",
+              id: record.id,
+              message: `Exception request ${record.id} recorded for ${repo} / ${ruleId}. It is pending review by the Codex owners.`
             };
           }
         }),
 
-        // Client-side tool: no execute function — the browser handles it
-        getUserTimezone: tool({
+        recent_activity: tool({
           description:
-            "Get the user's timezone from their browser. Use this when you need to know the user's local time.",
-          inputSchema: z.object({})
+            "Recall repositories scanned earlier in this conversation and any exceptions filed. Use when the user refers back to a previous scan.",
+          inputSchema: z.object({}),
+          execute: async () => ({
+            scans: this.state.scans,
+            exceptions: this.state.exceptions
+          })
         }),
 
-        // Approval tool: requires user confirmation before executing
-        calculate: tool({
+        schedule_rescan: tool({
           description:
-            "Perform a math calculation with two numbers. Requires user approval for large numbers.",
-          inputSchema: z.object({
-            a: z.number().describe("First number"),
-            b: z.number().describe("Second number"),
-            operator: z
-              .enum(["+", "-", "*", "/", "%"])
-              .describe("Arithmetic operator")
+            "Schedule a repository to be re-audited later, once or on a cron schedule.",
+          inputSchema: scheduleSchema.extend({
+            repo: z.string().describe('The repository, as "owner/name".')
           }),
-          needsApproval: async ({ a, b }) =>
-            Math.abs(a) > 1000 || Math.abs(b) > 1000,
-          execute: async ({ a, b, operator }) => {
-            const ops: Record<string, (x: number, y: number) => number> = {
-              "+": (x, y) => x + y,
-              "-": (x, y) => x - y,
-              "*": (x, y) => x * y,
-              "/": (x, y) => x / y,
-              "%": (x, y) => x % y
-            };
-            if (operator === "/" && b === 0) {
-              return { error: "Division by zero" };
-            }
-            return {
-              expression: `${a} ${operator} ${b}`,
-              result: ops[operator](a, b)
-            };
-          }
-        }),
-
-        scheduleTask: tool({
-          description:
-            "Schedule a task to be executed at a later time. Use this when the user asks to be reminded or wants something done later.",
-          inputSchema: scheduleSchema,
-          execute: async ({ when, description }) => {
-            if (when.type === "no-schedule") {
-              return "Not a valid schedule input";
-            }
+          execute: async ({ when, repo }) => {
+            if (when.type === "no-schedule") return "Not a valid schedule input";
             const input =
               when.type === "scheduled"
                 ? when.date
@@ -145,36 +300,34 @@ If the user asks to schedule a task, use the schedule tool to schedule the task.
                     : null;
             if (!input) return "Invalid schedule type";
             try {
-              this.schedule(input, "executeTask", description, {
-                idempotent: true
-              });
-              return `Task scheduled: "${description}" (${when.type}: ${input})`;
+              this.schedule(input, "runScheduledScan", { repo }, { idempotent: true });
+              return `Re-audit of ${repo} scheduled (${when.type}: ${input}).`;
             } catch (error) {
-              return `Error scheduling task: ${error}`;
+              return `Error scheduling re-audit: ${error}`;
             }
           }
         }),
 
-        getScheduledTasks: tool({
-          description: "List all tasks that have been scheduled",
+        list_scheduled_rescans: tool({
+          description: "List every scheduled re-audit.",
           inputSchema: z.object({}),
           execute: async () => {
             const tasks = this.getSchedules();
-            return tasks.length > 0 ? tasks : "No scheduled tasks found.";
+            return tasks.length > 0 ? tasks : "No re-audits scheduled.";
           }
         }),
 
-        cancelScheduledTask: tool({
-          description: "Cancel a scheduled task by its ID",
+        cancel_rescan: tool({
+          description: "Cancel a scheduled re-audit by its ID.",
           inputSchema: z.object({
-            taskId: z.string().describe("The ID of the task to cancel")
+            taskId: z.string().describe("The ID of the scheduled re-audit")
           }),
           execute: async ({ taskId }) => {
             try {
               this.cancelSchedule(taskId);
-              return `Task ${taskId} cancelled.`;
+              return `Re-audit ${taskId} cancelled.`;
             } catch (error) {
-              return `Error cancelling task: ${error}`;
+              return `Error cancelling re-audit: ${error}`;
             }
           }
         })
@@ -186,26 +339,85 @@ If the user asks to schedule a task, use the schedule tool to schedule the task.
     return result.toUIMessageStreamResponse();
   }
 
-  async executeTask(description: string, _task: Schedule<string>) {
-    // Do the actual work here (send email, call API, etc.)
-    console.log(`Executing scheduled task: ${description}`);
-
-    // Notify connected clients via a broadcast event.
-    // We use broadcast() instead of saveMessages() to avoid injecting
-    // into chat history — that would cause the AI to see the notification
-    // as new context and potentially loop.
-    this.broadcast(
-      JSON.stringify({
-        type: "scheduled-task",
-        description,
-        timestamp: new Date().toISOString()
-      })
-    );
+  /**
+   * Alarm callback for schedule_rescan. Runs with no user present, so it writes
+   * to state and broadcasts rather than injecting into chat history — pushing a
+   * message into `this.messages` here would give the model new context to react
+   * to and can send it into a loop.
+   */
+  async runScheduledScan(
+    payload: { repo: string },
+    _task: Schedule<{ repo: string }>
+  ) {
+    try {
+      const report = await scanRepository(payload.repo, this.env.GITHUB_TOKEN);
+      this.rememberScan(report);
+      this.broadcast(
+        JSON.stringify({
+          type: "scheduled-scan",
+          repo: report.repo,
+          passed: report.passed,
+          failed: report.failed,
+          timestamp: report.checkedAt
+        })
+      );
+    } catch (error) {
+      this.broadcast(
+        JSON.stringify({
+          type: "scheduled-scan-failed",
+          repo: payload.repo,
+          error: String(error),
+          timestamp: new Date().toISOString()
+        })
+      );
+    }
   }
 }
 
 export default {
   async fetch(request: Request, env: Env) {
+    const url = new URL(request.url);
+
+    /**
+     * Day-1 checkpoint endpoint: the rule engine with no LLM in the path.
+     *
+     *   curl "https://<worker>/api/scan?repo=sindresorhus/got"
+     *   curl -X POST https://<worker>/api/scan -d '{"repo":"owner/name"}'
+     *
+     * Keep this after day 2. It is the fastest way to debug a rule without
+     * burning a model call, and it makes the deterministic core demoable on
+     * its own — useful when explaining the design in an interview.
+     */
+    if (url.pathname === "/api/scan") {
+      let repo = url.searchParams.get("repo") ?? "";
+      if (request.method === "POST") {
+        try {
+          const body = (await request.json()) as { repo?: string };
+          repo = body.repo ?? repo;
+        } catch {
+          return Response.json({ error: "Body must be JSON." }, { status: 400 });
+        }
+      }
+      if (!repo) {
+        return Response.json(
+          { error: 'Provide a repository, e.g. ?repo=owner/name' },
+          { status: 400 }
+        );
+      }
+      try {
+        const report = await scanRepository(repo, env.GITHUB_TOKEN);
+        return Response.json(report);
+      } catch (error) {
+        if (error instanceof GitHubError) {
+          return Response.json(
+            { error: error.message, kind: error.kind },
+            { status: error.status === 0 ? 502 : error.status }
+          );
+        }
+        return Response.json({ error: String(error) }, { status: 500 });
+      }
+    }
+
     return (
       (await routeAgentRequest(request, env)) ||
       new Response("Not found", { status: 404 })
