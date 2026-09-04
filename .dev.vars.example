@@ -1,0 +1,7 @@
+# Copy to .dev.vars for local dev:  cp .dev.vars.example .dev.vars
+# For the deployed Worker:          npx wrangler secret put GITHUB_TOKEN
+#
+# A classic PAT with NO scopes ticked is sufficient — every GitHub endpoint this
+# app touches is public read. It exists purely to lift the rate limit from
+# 60 req/hr (unauthenticated) to 5000 req/hr.
+GITHUB_TOKEN=""
